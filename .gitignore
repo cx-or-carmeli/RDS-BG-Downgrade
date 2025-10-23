@@ -1,0 +1,7 @@
+# Ignore temp files
+*.log
+*.tmp
+*.swp
+.DS_Store
+.env
+
