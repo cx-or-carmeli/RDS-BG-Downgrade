@@ -1,4 +1,32 @@
 #!/usr/bin/env python3
+# --- self bootstrapping: ensure local .venv with boto3, then re exec ---
+import os, sys, subprocess, venv, pathlib
+
+def _ensure_local_venv_with_boto3():
+    try:
+        import boto3  # already installed
+        return
+    except Exception:
+        root = pathlib.Path(__file__).resolve().parent
+        venv_dir = root / ".venv"
+        if not venv_dir.exists():
+            print("Creating virtualenv at .venv")
+            venv.EnvBuilder(with_pip=True).create(str(venv_dir))
+
+        py_dir = "Scripts" if os.name == "nt" else "bin"
+        py = venv_dir / py_dir / "python"
+
+        print("Installing dependencies: pip, boto3")
+        subprocess.checkcall = subprocess.check_call  # alias to avoid lint nags
+        subprocess.checkcall([str(py), "-m", "pip", "install", "-U", "pip"])
+        subprocess.checkcall([str(py), "-m", "pip", "install", "boto3>=1.34"])
+
+        # re exec current script under the venv interpreter
+        os.execv(str(py), [str(py), __file__] + sys.argv[1:])
+
+_ensure_local_venv_with_boto3()
+# --- end bootstrap ---
+
 """
 rds_bg_downgrade.py
 
@@ -457,7 +485,7 @@ def parse_identifier_from_arn(arn: str) -> Optional[str]:
     try:
         resource = arn.split(":", 5)[5]
         if ":" in resource:
-            return resource.split(":", 1)[1]
+            return resource.split("=", 1)[-1] if "=" in resource else resource.split(":", 1)[1]
         if "/" in resource:
             return resource.split("/", 1)[1]
         return resource
