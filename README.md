@@ -35,3 +35,8 @@ The script will automatically install `boto3` if needed.
 - **Safety**: Test green environment before switching
 - **Rollback**: Easy revert if issues occur
 - **Zero data loss**: Continuous replication until switch
+
+## Files
+
+- `rds_bg_resize.py` - Main script (433 lines)
+- `config.py` - Configuration (instance specs, thresholds, timeouts)
