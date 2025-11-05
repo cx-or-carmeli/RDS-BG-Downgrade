@@ -128,8 +128,8 @@ def print_checks(metrics, title="Checks"):
     mem = (metrics.get("FreeableMemory") or 0) / GIB
     ok = cpu <= CPU_WARN and mem >= MEM_WARN
     if not ok:
-        print(f"  ⚠️  CPU {cpu:.1f}% or Memory {mem:.1f}GiB concerning")
-    print(f"Status: {'✅ OK' if ok else '⚠️  Warning'}")
+        print(f"  WARNING: CPU {cpu:.1f}% or Memory {mem:.1f}GiB concerning")
+    print(f"Status: {'OK' if ok else 'Warning'}")
     return ok
 
 def wait_snapshot(rds, is_clu, snap_id):
@@ -145,7 +145,7 @@ def wait_snapshot(rds, is_clu, snap_id):
             if pct != last_pct:
                 print(f"  {pct}% - {status}"); last_pct = pct
             if status == "available":
-                print("✅ Snapshot ready"); return
+                print("Snapshot ready"); return
         except: pass
         time.sleep(POLL_INTERVAL)
 
@@ -163,9 +163,9 @@ def create_snapshot(rds, identifier):
     return snap_id
 
 def check_suitability(identifier, current_class, target_class, metrics):
-    print(f"\n=== Suitability: {current_class} → {target_class} ===")
+    print(f"\n=== Suitability: {current_class} -> {target_class} ===")
     if current_class not in INSTANCE_SPECS or target_class not in INSTANCE_SPECS:
-        print("⚠️  Specs unknown, skipping"); return True
+        print("WARNING: Specs unknown, skipping"); return True
     curr_cpu, curr_mem = INSTANCE_SPECS[current_class]
     tgt_cpu, tgt_mem = INSTANCE_SPECS[target_class]
     print(f"Current: {curr_cpu} vCPUs, {curr_mem} GiB | Target: {tgt_cpu} vCPUs, {tgt_mem} GiB")
@@ -174,15 +174,15 @@ def check_suitability(identifier, current_class, target_class, metrics):
     
     cpu = metrics.get("CPUUtilization") or 0
     proj_cpu = cpu * (curr_cpu / tgt_cpu) if tgt_cpu > 0 else cpu
-    print(f"CPU: {cpu:.1f}% → {proj_cpu:.1f}%")
+    print(f"CPU: {cpu:.1f}% -> {proj_cpu:.1f}%")
     
     mem = (metrics.get("FreeableMemory") or 0) / GIB
     proj_mem = mem + (tgt_mem - curr_mem)
-    print(f"Memory: {mem:.1f}GiB → {proj_mem:.1f}GiB free")
+    print(f"Memory: {mem:.1f}GiB -> {proj_mem:.1f}GiB free")
     
     if proj_cpu > CPU_CRIT or proj_mem < MEM_CRIT:
-        print(f"❌ CRITICAL: CPU {proj_cpu:.0f}% or Memory {proj_mem:.1f}GiB"); return False
-    print("✅ Suitable"); return True
+        print(f"CRITICAL: CPU {proj_cpu:.0f}% or Memory {proj_mem:.1f}GiB"); return False
+    print("Suitable"); return True
 
 def list_orderable(rds, engine, version, storage_type):
     classes = set()
@@ -231,17 +231,79 @@ def estimate_eta(engine, storage_gb):
     if storage_gb <= 500: return (20, 60)
     return (30, 120)
 
+def find_existing_bg_for_source(rds, identifier):
+    """Find existing Blue/Green deployment for a source database."""
+    is_clu, desc = is_cluster(rds, identifier)
+    source_arn = (desc["DBClusterArn"] if is_clu else desc["DBInstanceArn"]).lower()
+    
+    for page in rds.get_paginator("describe_blue_green_deployments").paginate():
+        for d in page.get("BlueGreenDeployments", []):
+            if d.get("Status") != "DELETED":
+                src = d.get("Source", "")
+                if isinstance(src, str) and src.lower() == source_arn:
+                    return d
+    return None
+
 def create_bg(rds, identifier, target_class):
     is_clu, desc = is_cluster(rds, identifier)
     name = f"bg-{identifier}-{now_utc().strftime('%Y%m%d-%H%M%S')}"
     arn = desc["DBClusterArn"] if is_clu else desc["DBInstanceArn"]
     print(f"\nCreating Blue/Green: {name}")
-    resp = rds.create_blue_green_deployment(BlueGreenDeploymentName=name, Source=arn,
-                                            TargetDBInstanceClass=target_class,
-                                            Tags=[{"Key": "purpose", "Value": "resize"}])
-    bg_id = resp["BlueGreenDeployment"]["BlueGreenDeploymentIdentifier"]
-    print(f"Created: {bg_id}")
-    return bg_id
+    try:
+        resp = rds.create_blue_green_deployment(BlueGreenDeploymentName=name, Source=arn,
+                                                TargetDBInstanceClass=target_class,
+                                                Tags=[{"Key": "purpose", "Value": "resize"}])
+        bg_id = resp["BlueGreenDeployment"]["BlueGreenDeploymentIdentifier"]
+        print(f"Created: {bg_id}")
+        return bg_id
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "BlueGreenDeploymentAlreadyExistsFault":
+            print(f"\nWARNING: A Blue/Green deployment already exists for: {identifier}")
+            
+            # Try to find the existing deployment
+            existing = find_existing_bg_for_source(rds, identifier)
+            if existing:
+                bg_id = existing.get("BlueGreenDeploymentIdentifier", "")
+                status = existing.get("Status", "")
+                created = existing.get("CreateTime", "")
+                print(f"\nExisting deployment:")
+                print(f"  ID: {bg_id[:30]}...")
+                print(f"  Status: {status}")
+                print(f"  Created: {created}")
+                
+                print("\nWhat would you like to do?")
+                print("  1) Continue with existing deployment")
+                print("  2) Delete existing and create new")
+                print("  0) Cancel")
+                
+                choice = input("Choice: ").strip()
+                
+                if choice == "1":
+                    print(f"Using existing deployment: {bg_id[:30]}...")
+                    return bg_id
+                elif choice == "2":
+                    print(f"\nDeleting existing deployment...")
+                    try:
+                        rds.delete_blue_green_deployment(BlueGreenDeploymentIdentifier=bg_id)
+                        print("Waiting for deletion...")
+                        while True:
+                            try:
+                                rds.describe_blue_green_deployments(BlueGreenDeploymentIdentifier=bg_id)
+                                time.sleep(3)
+                            except ClientError:
+                                break
+                        print("Deleted. Creating new deployment...")
+                        return create_bg(rds, identifier, target_class)
+                    except ClientError as del_err:
+                        print(f"Failed to delete: {del_err}")
+                        return None
+                else:
+                    print("Cancelled")
+                    return None
+            else:
+                print("Could not find the existing deployment. Try 'Resume existing' from main menu.")
+                return None
+        raise
 
 def bg_status(rds, bg_id):
     try:
@@ -272,7 +334,7 @@ def switch_over(rds, bg_id):
         st = s.get('Status')
         print(f"  {st}")
         if st == "SWITCHOVER_COMPLETED":
-            print("✅ Complete"); return
+            print("Complete"); return
         if st in ("SWITCHOVER_FAILED", "DELETED"):
             raise RuntimeError(f"Failed: {st}")
         time.sleep(10)
@@ -280,7 +342,7 @@ def switch_over(rds, bg_id):
 def verify_endpoint(rds, identifier):
     is_clu, desc = is_cluster(rds, identifier)
     ep = desc.get("Endpoint") or {}
-    print(f"\n✅ Verified: {identifier} | {ep.get('Address')}:{ep.get('Port')}")
+    print(f"\nVerified: {identifier} | {ep.get('Address')}:{ep.get('Port')}")
 
 def list_bgs(rds):
     items = []
@@ -306,7 +368,7 @@ def delete_bg(rds, bg_id):
     rds.delete_blue_green_deployment(BlueGreenDeploymentIdentifier=bg_id)
     while bg_status(rds, bg_id):
         time.sleep(5)
-    print("✅ Deleted")
+    print("Deleted")
 
 def find_old_resource(rds, base_id):
     """Find old resource with -old suffix."""
@@ -335,7 +397,7 @@ def rollback(rds, cw, identifier):
     
     old = find_old_resource(rds, base_id)
     if not old or not old.get("class"):
-        print(f"❌ No old resource found for: {base_id}")
+        print(f"No old resource found for: {base_id}")
         print("   Rollback only works after switchover")
         return
     
@@ -350,6 +412,9 @@ def rollback(rds, cw, identifier):
     
     print(f"Creating reverse Blue/Green to {target_class}...")
     bg_id = create_bg(rds, base_id, target_class)
+    if not bg_id:
+        return
+    
     is_clu, desc = is_cluster(rds, base_id)
     lo, hi = estimate_eta(desc.get("Engine"), desc.get("AllocatedStorage"))
     print(f"ETA: {lo}-{hi} min")
@@ -359,9 +424,9 @@ def rollback(rds, cw, identifier):
         switch_over(rds, bg_id)
         verify_endpoint(rds, base_id)
         print_checks(prechecks(rds, cw, base_id), "Post-rollback")
-        print(f"✅ Rolled back to {target_class}")
+        print(f"Rolled back to {target_class}")
     else:
-        print("⚠️  Not ready. Check AWS Console")
+        print("Not ready. Check AWS Console")
 
 def delete_old(rds):
     items = []
@@ -389,7 +454,7 @@ def delete_old(rds):
                 rds.delete_db_instance(DBInstanceIdentifier=m["DBInstanceIdentifier"], SkipFinalSnapshot=True)
             except: pass
         rds.delete_db_cluster(DBClusterIdentifier=rid, SkipFinalSnapshot=True)
-    print("✅ Deleted")
+    print("Deleted")
 
 def main():
     sess = get_session()
@@ -403,9 +468,23 @@ def main():
         
         if m == "2":
             if not (bg_id := choose_bg(rds)): continue
+            # Try to extract identifier from BG deployment, or ask user
+            bg = bg_status(rds, bg_id)
+            identifier = None
+            if bg and (src := bg.get("Source")):
+                # Extract from ARN (format: arn:aws:rds:region:account:db:identifier)
+                try:
+                    identifier = src.split(":")[-1] if isinstance(src, str) else None
+                except: pass
+            if not identifier:
+                print("Select the database for this Blue/Green:")
+                identifier = choose_db(rds)["id"]
+            
             print("\n1) Switch\n2) Delete BG\n3) Status\n0) Back")
             if (c := input("Action: ").strip()) == "1":
                 switch_over(rds, bg_id)
+                verify_endpoint(rds, identifier)
+                print_checks(prechecks(rds, cw, identifier), "Post-switch")
             elif c == "2":
                 delete_bg(rds, bg_id)
             elif c == "3":
@@ -442,12 +521,15 @@ def main():
                 
                 create_snapshot(rds, identifier)
                 bg_id = create_bg(rds, identifier, target)
+                if not bg_id:
+                    input("\nPress Enter...")
+                    continue
                 lo, hi = estimate_eta(desc.get("Engine"), desc.get("AllocatedStorage"))
                 print(f"ETA: {lo}-{hi} min. Press Ctrl+C to stop watching.")
                 if wait_ready(rds, bg_id):
-                    print("✅ Ready to switch!")
+                    print("Ready to switch!")
                 else:
-                    print("⚠️  Check AWS Console")
+                    print("Check AWS Console")
                 input("\nPress Enter...")
             
             elif action == "2":
