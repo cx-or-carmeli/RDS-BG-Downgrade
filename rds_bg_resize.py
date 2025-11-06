@@ -24,7 +24,9 @@ from botocore.exceptions import ClientError, NoRegionError, ParamValidationError
 from config import (GIB, CPU_WARNING_THRESHOLD as CPU_WARN, CPU_CRITICAL_THRESHOLD as CPU_CRIT,
                     MEMORY_WARNING_GIB as MEM_WARN, MEMORY_CRITICAL_GIB as MEM_CRIT,
                     OLD_RESOURCE_SUFFIXES as OLD_SUFFIXES, DEFAULT_POLL_INTERVAL as POLL_INTERVAL,
-                    BG_SWITCH_POLL_INTERVAL as BG_POLL, BG_TIMEOUT_MINUTES as BG_TIMEOUT, INSTANCE_SPECS)
+                    BG_SWITCH_POLL_INTERVAL as BG_POLL, BG_TIMEOUT_MINUTES as BG_TIMEOUT, INSTANCE_SPECS,
+                    PREFERRED_INSTANCE_TYPES, MAX_INSTANCE_DISPLAY, DELETABLE_INSTANCE_STATES,
+                    ETA_ESTIMATES, STORAGE_THRESHOLDS)
 
 def now_utc():
     return dt.datetime.now(getattr(dt, "UTC", dt.timezone.utc))
@@ -203,10 +205,10 @@ def pick_target_class(rds, identifier):
                              desc.get("StorageType"))
     if not allowed:
         print("Can't retrieve classes"); sys.exit(2)
-    preferred = [c for c in allowed if any(k in c for k in ("t4g", "t3", "m6g", "m5"))]
+    preferred = [c for c in allowed if any(k in c for k in PREFERRED_INSTANCE_TYPES)]
     ordered = preferred + [c for c in allowed if c not in preferred]
     print("\nAvailable classes:")
-    for i, cls in enumerate(ordered[:50], 1):
+    for i, cls in enumerate(ordered[:MAX_INSTANCE_DISPLAY], 1):
         print(f"  {i}) {cls}")
     print("  0) Manual entry")
     while True:
@@ -216,17 +218,21 @@ def pick_target_class(rds, identifier):
             if idx == 0:
                 manual = input("Enter class (e.g. db.t3.medium): ").strip()
                 return manual if manual in allowed else print("Not allowed") or None
-            if 1 <= idx <= len(ordered[:50]):
+            if 1 <= idx <= len(ordered[:MAX_INSTANCE_DISPLAY]):
                 return ordered[idx - 1]
 
 # Estimate how long Blue/Green provisioning will take (in minutes)
 def estimate_eta(engine, storage_gb):
     eng = (engine or "").lower()
-    if "aurora" in eng: return (5, 25)
-    if not storage_gb: return (10, 45)
-    if storage_gb <= 100: return (10, 25)
-    if storage_gb <= 500: return (20, 60)
-    return (30, 120)
+    if "aurora" in eng: 
+        return ETA_ESTIMATES["aurora"]
+    if not storage_gb: 
+        return ETA_ESTIMATES["default"]
+    if storage_gb <= STORAGE_THRESHOLDS["small"]: 
+        return ETA_ESTIMATES["small"]
+    if storage_gb <= STORAGE_THRESHOLDS["medium"]: 
+        return ETA_ESTIMATES["medium"]
+    return ETA_ESTIMATES["large"]
 
 # Find existing Blue/Green deployment for a source database
 def find_existing_bg_for_source(rds, identifier):
@@ -458,7 +464,7 @@ def delete_old(rds):
         return
     
     # Check if in a state where deletion is not possible
-    if status not in ("available", "stopped", "storage-full", "incompatible-parameters", "incompatible-restore"):
+    if status not in DELETABLE_INSTANCE_STATES:
         print(f"WARNING: Cannot delete instance in '{status}' state")
         print("   Wait for the instance to reach 'available' state or check AWS Console")
         return

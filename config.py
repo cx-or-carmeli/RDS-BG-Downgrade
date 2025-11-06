@@ -13,6 +13,26 @@ DEFAULT_POLL_INTERVAL = 10
 BG_SWITCH_POLL_INTERVAL = 30
 BG_TIMEOUT_MINUTES = 90
 
+# Instance preferences and limits
+PREFERRED_INSTANCE_TYPES = ("t4g", "t3", "m6g", "m5")  # Cost-effective, modern instance families
+MAX_INSTANCE_DISPLAY = 50  # Maximum number of instance classes to show in menu
+
+# Valid RDS instance states for deletion
+DELETABLE_INSTANCE_STATES = ("available", "stopped", "storage-full", "incompatible-parameters", "incompatible-restore")
+
+# ETA estimates for Blue/Green provisioning (min, max) in minutes
+ETA_ESTIMATES = {
+    "aurora": (5, 25),      # Aurora is typically faster
+    "default": (10, 45),    # Unknown/no storage info
+    "small": (10, 25),      # <= 100 GB
+    "medium": (20, 60),     # <= 500 GB
+    "large": (30, 120),     # > 500 GB
+}
+STORAGE_THRESHOLDS = {
+    "small": 100,   # GB
+    "medium": 500,  # GB
+}
+
 # Instance specs: {instance_class: (vCPUs, memory_gib)}
 INSTANCE_SPECS = {
     # T3/T4g burstable
