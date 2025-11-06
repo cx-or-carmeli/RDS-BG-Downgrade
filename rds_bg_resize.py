@@ -157,24 +157,24 @@ def check_suitability(identifier, current_class, target_class, metrics):
     print(f"Memory: {mem:.1f}GiB -> {proj_mem:.1f}GiB free")
     
     if proj_cpu > CPU_CRIT or proj_mem < MEM_CRIT:
-        print(f"\n❌ CRITICAL: Target instance insufficient!")
+        print(f"\nCRITICAL: Target instance insufficient!")
         if proj_cpu > CPU_CRIT:
             print(f"   CPU would be {proj_cpu:.0f}% (max safe: {CPU_CRIT:.0f}%)")
         if proj_mem < MEM_CRIT:
             print(f"   Free memory would be {proj_mem:.1f}GiB (minimum: {MEM_CRIT:.1f}GiB)")
-        print(f"\n⚠️  AWS Recommendation: Choose a larger instance class")
+        print(f"\nAWS Recommendation: Choose a larger instance class")
         print(f"   Minimum safe target: ~{curr_mem}+ GiB RAM")
         return False
     
     if proj_cpu > CPU_WARN or proj_mem < MEM_WARN:
-        print(f"\n⚠️  WARNING: Marginal capacity")
+        print(f"\nWARNING: Marginal capacity")
         if proj_cpu > CPU_WARN:
             print(f"   CPU would be {proj_cpu:.0f}% (warning: {CPU_WARN:.0f}%)")
         if proj_mem < MEM_WARN:
             print(f"   Free memory would be {proj_mem:.1f}GiB (warning: {MEM_WARN:.1f}GiB)")
         print(f"   Consider a larger instance for better performance")
     else:
-        print("✅ Suitable")
+        print("Suitable")
     
     return True
 
@@ -440,8 +440,8 @@ def delete_old(rds):
     
     print("\nOld instances:")
     for i, item in enumerate(items, 1):
-        status_icon = "🔄" if "delet" in item["status"] else "✓"
-        print(f"  {i}) {item['id']} [{status_icon} {item['status']}]")
+        status_icon = "[DELETING]" if "delet" in item["status"] else ""
+        print(f"  {i}) {item['id']} {status_icon} ({item['status']})")
     
     sel = input("Pick to delete (0=cancel): ").strip()
     if not sel.isdigit() or not (1 <= int(sel) <= len(items)):
@@ -453,27 +453,27 @@ def delete_old(rds):
     
     # Check if already being deleted
     if "delet" in status:
-        print(f"⚠️  Instance is already being deleted (status: {status})")
+        print(f"WARNING: Instance is already being deleted (status: {status})")
         print("   No action needed - AWS is processing the deletion.")
         return
     
     # Check if in a state where deletion is not possible
     if status not in ("available", "stopped", "storage-full", "incompatible-parameters", "incompatible-restore"):
-        print(f"⚠️  Cannot delete instance in '{status}' state")
+        print(f"WARNING: Cannot delete instance in '{status}' state")
         print("   Wait for the instance to reach 'available' state or check AWS Console")
         return
     
     print(f"Deleting instance: {rid}")
     try:
         rds.delete_db_instance(DBInstanceIdentifier=rid, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
-        print("✅ Deletion initiated successfully")
+        print("Deletion initiated successfully")
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
         if error_code == "InvalidDBInstanceState":
-            print(f"⚠️  Instance is already being deleted or in invalid state")
+            print(f"WARNING: Instance is already being deleted or in invalid state")
             print("   Check AWS Console for current status")
         else:
-            print(f"❌ Error: {e}")
+            print(f"ERROR: {e}")
             raise
 
 # Main menu: create new resize, resume existing, or manage old resources
@@ -560,13 +560,13 @@ def main():
                 
                 metrics = prechecks(rds, cw, identifier)
                 if not print_checks(metrics):
-                    print("⚠️  Pre-checks show concerning values. Review before proceeding.")
+                    print("WARNING: Pre-checks show concerning values. Review before proceeding.")
                     if input("Continue anyway? (yes): ").strip().lower() != "yes": 
                         continue
                 
                 if current:
                     if not check_suitability(identifier, current, target, metrics):
-                        print("\n🚫 Cannot proceed - target instance is insufficient for current workload.")
+                        print("\nBLOCKED: Cannot proceed - target instance is insufficient for current workload.")
                         input("Press Enter to choose a different instance class...")
                         continue
                 
