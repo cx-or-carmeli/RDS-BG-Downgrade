@@ -1,6 +1,6 @@
 # RDS Blue/Green Instance Resize
 
-Automates RDS/Aurora instance class changes (upgrades & downgrades) using AWS Blue/Green deployments with minimal downtime.
+Automates RDS instance class changes (upgrades & downgrades) using AWS Blue/Green deployments with minimal downtime.
 
 ## Quick Start
 
@@ -38,5 +38,5 @@ The script will automatically install `boto3` if needed.
 
 ## Files
 
-- `rds_bg_resize.py` - Main script (433 lines)
+- `rds_bg_resize.py` - Main script (RDS instances only)
 - `config.py` - Configuration (instance specs, thresholds, timeouts)

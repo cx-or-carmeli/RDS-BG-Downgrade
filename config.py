@@ -1,11 +1,11 @@
 """Configuration for RDS Blue/Green Instance Resize."""
 
-# Thresholds
+# Thresholds (based on AWS best practices)
 GIB = 1024 ** 3
-CPU_WARNING_THRESHOLD = 40.0
-CPU_CRITICAL_THRESHOLD = 80.0
-MEMORY_WARNING_GIB = 1.0
-MEMORY_CRITICAL_GIB = 0.5
+CPU_WARNING_THRESHOLD = 60.0    # AWS recommends monitoring at 60%
+CPU_CRITICAL_THRESHOLD = 80.0   # AWS recommends alarm at 80%
+MEMORY_WARNING_GIB = 2.0        # AWS recommends minimum 2 GiB freeable memory
+MEMORY_CRITICAL_GIB = 1.0       # Absolute minimum for safe operation
 COMBINED_CPU_THRESHOLD = 30.0
 COMBINED_MEMORY_THRESHOLD = 2.0 * GIB
 OLD_RESOURCE_SUFFIXES = ("-old1", "-old2", "-old", "-blue", "-previous")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RDS Blue/Green Instance Resize - Automates RDS/Aurora instance class changes via Blue/Green deployments."""
+"""RDS Blue/Green Instance Resize - Automates RDS instance class changes via Blue/Green deployments."""
 import os, pathlib, subprocess, sys, venv
 
 # Ensure boto3 is installed (auto-creates venv and installs if missing)
@@ -55,21 +55,9 @@ def select_from_list(items, prompt="Choose"):
 def list_dbs(rds):
     items = []
     try:
-        for page in rds.get_paginator("describe_db_clusters").paginate():
-            for c in page.get("DBClusters", []):
-                writer = next((m.get("DBInstanceIdentifier") for m in c.get("DBClusterMembers", []) if m.get("IsClusterWriter")), None)
-                cls = None
-                if writer:
-                    try:
-                        cls = rds.describe_db_instances(DBInstanceIdentifier=writer)["DBInstances"][0].get("DBInstanceClass")
-                    except: pass
-                items.append({"type": "cluster", "id": c["DBClusterIdentifier"], "engine": c.get("Engine"),
-                             "version": c.get("EngineVersion"), "class": cls, "storage_gb": None})
-    except: pass
-    try:
         for page in rds.get_paginator("describe_db_instances").paginate():
             for i in page.get("DBInstances", []):
-                items.append({"type": "instance", "id": i["DBInstanceIdentifier"], "engine": i.get("Engine"),
+                items.append({"id": i["DBInstanceIdentifier"], "engine": i.get("Engine"),
                              "version": i.get("EngineVersion"), "class": i.get("DBInstanceClass"),
                              "storage_gb": i.get("AllocatedStorage"), "storage_type": i.get("StorageType")})
     except: pass
@@ -79,22 +67,18 @@ def choose_db(rds):
     items = list_dbs(rds)
     if not items:
         print("No databases found"); sys.exit(2)
-    print("\nDatabases:")
+    print("\nRDS Instances:")
     for i, item in enumerate(items, 1):
         storage = f", {item.get('storage_gb')}GB" if item.get('storage_gb') else ""
-        print(f"  {i}) [{item['type']}] {item['id']} | {item.get('engine')} | {item.get('class')}{storage}")
+        print(f"  {i}) {item['id']} | {item.get('engine')} | {item.get('class')}{storage}")
     return select_from_list(items)
 
+# Get RDS instance description (returns False for legacy compatibility, description)
 def is_cluster(rds, identifier):
-    try:
-        return True, rds.describe_db_clusters(DBClusterIdentifier=identifier)["DBClusters"][0]
-    except ClientError:
-        pass
     try:
         return False, rds.describe_db_instances(DBInstanceIdentifier=identifier)["DBInstances"][0]
     except ClientError:
-        pass
-    print(f"Not found: {identifier}"); sys.exit(2)
+        print(f"Instance not found: {identifier}"); sys.exit(2)
 
 def get_metric(cw, metric, inst_id, minutes=15):
     start, end = time_range(minutes)
@@ -106,14 +90,8 @@ def get_metric(cw, metric, inst_id, minutes=15):
 
 # Get CloudWatch metrics (CPU, memory, IOPS, connections) for pre/post validation
 def prechecks(rds, cw, identifier):
-    is_clu, desc = is_cluster(rds, identifier)
-    if is_clu:
-        writer = next((m for m in desc.get("DBClusterMembers", []) if m.get("IsClusterWriter")), None)
-        inst_id = writer["DBInstanceIdentifier"] if writer else None
-        if not inst_id:
-            raise RuntimeError("No writer found")
-    else:
-        inst_id = desc["DBInstanceIdentifier"]
+    _, desc = is_cluster(rds, identifier)
+    inst_id = desc["DBInstanceIdentifier"]
     return {
         "CPUUtilization": get_metric(cw, "CPUUtilization", inst_id),
         "FreeableMemory": get_metric(cw, "FreeableMemory", inst_id),
@@ -136,15 +114,12 @@ def print_checks(metrics, title="Checks"):
     return ok
 
 # Poll snapshot status until it's ready (shows progress percentage)
-def wait_snapshot(rds, is_clu, snap_id):
+def wait_snapshot(rds, snap_id):
     print("Waiting for snapshot...")
-    func = rds.describe_db_cluster_snapshots if is_clu else rds.describe_db_snapshots
-    param = "DBClusterSnapshotIdentifier" if is_clu else "DBSnapshotIdentifier"
-    key = "DBClusterSnapshots" if is_clu else "DBSnapshots"
     last_pct = -1
     while True:
         try:
-            snap = func(**{param: snap_id})[key][0]
+            snap = rds.describe_db_snapshots(DBSnapshotIdentifier=snap_id)["DBSnapshots"][0]
             status, pct = snap.get("Status"), snap.get("PercentProgress", 0)
             if pct != last_pct:
                 print(f"  {pct}% - {status}"); last_pct = pct
@@ -155,16 +130,11 @@ def wait_snapshot(rds, is_clu, snap_id):
 
 # Create a backup snapshot before making changes
 def create_snapshot(rds, identifier):
-    is_clu, _ = is_cluster(rds, identifier)
     snap_id = f"{identifier}-pre-resize-{now_utc().strftime('%Y%m%d-%H%M%S')}"
     print(f"\nCreating snapshot: {snap_id}")
-    if is_clu:
-        rds.create_db_cluster_snapshot(DBClusterSnapshotIdentifier=snap_id, DBClusterIdentifier=identifier,
-                                       Tags=[{"Key": "purpose", "Value": "pre-resize"}])
-    else:
-        rds.create_db_snapshot(DBSnapshotIdentifier=snap_id, DBInstanceIdentifier=identifier,
-                              Tags=[{"Key": "purpose", "Value": "pre-resize"}])
-    wait_snapshot(rds, is_clu, snap_id)
+    rds.create_db_snapshot(DBSnapshotIdentifier=snap_id, DBInstanceIdentifier=identifier,
+                          Tags=[{"Key": "purpose", "Value": "pre-resize"}])
+    wait_snapshot(rds, snap_id)
     return snap_id
 
 # Analyze if target instance can handle current workload (CPU/memory projection)
@@ -187,8 +157,26 @@ def check_suitability(identifier, current_class, target_class, metrics):
     print(f"Memory: {mem:.1f}GiB -> {proj_mem:.1f}GiB free")
     
     if proj_cpu > CPU_CRIT or proj_mem < MEM_CRIT:
-        print(f"CRITICAL: CPU {proj_cpu:.0f}% or Memory {proj_mem:.1f}GiB"); return False
-    print("Suitable"); return True
+        print(f"\n❌ CRITICAL: Target instance insufficient!")
+        if proj_cpu > CPU_CRIT:
+            print(f"   CPU would be {proj_cpu:.0f}% (max safe: {CPU_CRIT:.0f}%)")
+        if proj_mem < MEM_CRIT:
+            print(f"   Free memory would be {proj_mem:.1f}GiB (minimum: {MEM_CRIT:.1f}GiB)")
+        print(f"\n⚠️  AWS Recommendation: Choose a larger instance class")
+        print(f"   Minimum safe target: ~{curr_mem}+ GiB RAM")
+        return False
+    
+    if proj_cpu > CPU_WARN or proj_mem < MEM_WARN:
+        print(f"\n⚠️  WARNING: Marginal capacity")
+        if proj_cpu > CPU_WARN:
+            print(f"   CPU would be {proj_cpu:.0f}% (warning: {CPU_WARN:.0f}%)")
+        if proj_mem < MEM_WARN:
+            print(f"   Free memory would be {proj_mem:.1f}GiB (warning: {MEM_WARN:.1f}GiB)")
+        print(f"   Consider a larger instance for better performance")
+    else:
+        print("✅ Suitable")
+    
+    return True
 
 # Get list of instance classes available for this engine/version
 def list_orderable(rds, engine, version, storage_type):
@@ -210,9 +198,9 @@ def list_orderable(rds, engine, version, storage_type):
 
 # Show available instance classes and let user choose target
 def pick_target_class(rds, identifier):
-    is_clu, desc = is_cluster(rds, identifier)
+    _, desc = is_cluster(rds, identifier)
     allowed = list_orderable(rds, desc.get("Engine", "").lower(), desc.get("EngineVersion", ""),
-                             None if is_clu else desc.get("StorageType"))
+                             desc.get("StorageType"))
     if not allowed:
         print("Can't retrieve classes"); sys.exit(2)
     preferred = [c for c in allowed if any(k in c for k in ("t4g", "t3", "m6g", "m5"))]
@@ -243,8 +231,8 @@ def estimate_eta(engine, storage_gb):
 # Find existing Blue/Green deployment for a source database
 def find_existing_bg_for_source(rds, identifier):
     """Find existing Blue/Green deployment for a source database."""
-    is_clu, desc = is_cluster(rds, identifier)
-    source_arn = (desc["DBClusterArn"] if is_clu else desc["DBInstanceArn"]).lower()
+    _, desc = is_cluster(rds, identifier)
+    source_arn = desc["DBInstanceArn"].lower()
     
     for page in rds.get_paginator("describe_blue_green_deployments").paginate():
         for d in page.get("BlueGreenDeployments", []):
@@ -256,9 +244,9 @@ def find_existing_bg_for_source(rds, identifier):
 
 # Create Blue/Green deployment (handles existing deployment conflict gracefully)
 def create_bg(rds, identifier, target_class):
-    is_clu, desc = is_cluster(rds, identifier)
+    _, desc = is_cluster(rds, identifier)
     name = f"bg-{identifier}-{now_utc().strftime('%Y%m%d-%H%M%S')}"
-    arn = desc["DBClusterArn"] if is_clu else desc["DBInstanceArn"]
+    arn = desc["DBInstanceArn"]
     print(f"\nCreating Blue/Green: {name}")
     try:
         resp = rds.create_blue_green_deployment(BlueGreenDeploymentName=name, Source=arn,
@@ -355,7 +343,7 @@ def switch_over(rds, bg_id):
 
 # Verify database endpoint after switchover (confirms endpoint unchanged)
 def verify_endpoint(rds, identifier):
-    is_clu, desc = is_cluster(rds, identifier)
+    _, desc = is_cluster(rds, identifier)
     ep = desc.get("Endpoint") or {}
     print(f"\nVerified: {identifier} | {ep.get('Address')}:{ep.get('Port')}")
 
@@ -393,16 +381,7 @@ def find_old_resource(rds, base_id):
     """Find old resource with -old suffix."""
     for i in rds.describe_db_instances().get("DBInstances", []):
         if any(i["DBInstanceIdentifier"] == base_id + s for s in OLD_SUFFIXES):
-            return {"type": "instance", "id": i["DBInstanceIdentifier"], "class": i.get("DBInstanceClass")}
-    for c in rds.describe_db_clusters().get("DBClusters", []):
-        if any(c["DBClusterIdentifier"] == base_id + s for s in OLD_SUFFIXES):
-            writer = next((m.get("DBInstanceIdentifier") for m in c.get("DBClusterMembers", []) if m.get("IsClusterWriter")), None)
-            cls = None
-            if writer:
-                try:
-                    cls = rds.describe_db_instances(DBInstanceIdentifier=writer)["DBInstances"][0].get("DBInstanceClass")
-                except: pass
-            return {"type": "cluster", "id": c["DBClusterIdentifier"], "class": cls}
+            return {"id": i["DBInstanceIdentifier"], "class": i.get("DBInstanceClass")}
     return None
 
 # Rollback to previous instance class via reverse Blue/Green
@@ -435,7 +414,7 @@ def rollback(rds, cw, identifier):
     if not bg_id:
         return
     
-    is_clu, desc = is_cluster(rds, base_id)
+    _, desc = is_cluster(rds, base_id)
     lo, hi = estimate_eta(desc.get("Engine"), desc.get("AllocatedStorage"))
     print(f"ETA: {lo}-{hi} min")
     
@@ -448,34 +427,54 @@ def rollback(rds, cw, identifier):
     else:
         print("Not ready. Check AWS Console")
 
-# Clean up old resources (instances/clusters with -old suffix)
+# Clean up old resources (instances with -old suffix)
 def delete_old(rds):
     items = []
     for i in rds.describe_db_instances().get("DBInstances", []):
         if any(i["DBInstanceIdentifier"].endswith(s) for s in OLD_SUFFIXES):
-            items.append(("instance", i["DBInstanceIdentifier"]))
-    for c in rds.describe_db_clusters().get("DBClusters", []):
-        if any(c["DBClusterIdentifier"].endswith(s) for s in OLD_SUFFIXES):
-            items.append(("cluster", c["DBClusterIdentifier"]))
+            status = i.get("DBInstanceStatus", "").lower()
+            items.append({"id": i["DBInstanceIdentifier"], "status": status})
+    
     if not items:
-        print("No old resources found"); return
-    print("\nOld resources:")
-    for i, (typ, rid) in enumerate(items, 1):
-        print(f"  {i}) [{typ}] {rid}")
+        print("No old instances found"); return
+    
+    print("\nOld instances:")
+    for i, item in enumerate(items, 1):
+        status_icon = "🔄" if "delet" in item["status"] else "✓"
+        print(f"  {i}) {item['id']} [{status_icon} {item['status']}]")
+    
     sel = input("Pick to delete (0=cancel): ").strip()
     if not sel.isdigit() or not (1 <= int(sel) <= len(items)):
         return
-    typ, rid = items[int(sel) - 1]
-    print(f"Deleting {typ}: {rid}")
-    if typ == "instance":
+    
+    selected = items[int(sel) - 1]
+    rid = selected["id"]
+    status = selected["status"]
+    
+    # Check if already being deleted
+    if "delet" in status:
+        print(f"⚠️  Instance is already being deleted (status: {status})")
+        print("   No action needed - AWS is processing the deletion.")
+        return
+    
+    # Check if in a state where deletion is not possible
+    if status not in ("available", "stopped", "storage-full", "incompatible-parameters", "incompatible-restore"):
+        print(f"⚠️  Cannot delete instance in '{status}' state")
+        print("   Wait for the instance to reach 'available' state or check AWS Console")
+        return
+    
+    print(f"Deleting instance: {rid}")
+    try:
         rds.delete_db_instance(DBInstanceIdentifier=rid, SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
-    else:
-        for m in rds.describe_db_clusters(DBClusterIdentifier=rid)["DBClusters"][0].get("DBClusterMembers", []):
-            try:
-                rds.delete_db_instance(DBInstanceIdentifier=m["DBInstanceIdentifier"], SkipFinalSnapshot=True)
-            except: pass
-        rds.delete_db_cluster(DBClusterIdentifier=rid, SkipFinalSnapshot=True)
-    print("Deleted")
+        print("✅ Deletion initiated successfully")
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code == "InvalidDBInstanceState":
+            print(f"⚠️  Instance is already being deleted or in invalid state")
+            print("   Check AWS Console for current status")
+        else:
+            print(f"❌ Error: {e}")
+            raise
 
 # Main menu: create new resize, resume existing, or manage old resources
 def main():
@@ -484,8 +483,18 @@ def main():
     rds, cw = sess.client("rds"), sess.client("cloudwatch")
     
     while True:
-        print("\n=== Main Menu ===\n1) New resize\n2) Resume existing\n0) Quit")
-        if (m := input("Choice: ").strip()) == "0":
+        print("\n" + "="*60)
+        print("=== Main Menu ===".center(60))
+        print("="*60)
+        print("1) New resize       - Change instance class (upgrade/downgrade)")
+        print("2) Resume existing  - Continue with existing Blue/Green deployment")
+        print("3) Rollback         - Revert to previous instance class")
+        print("4) Delete old       - Clean up old resources after resize")
+        print("0) Quit")
+        print("="*60)
+        
+        m = input("Choice: ").strip()
+        if m == "0":
             print("Goodbye"); return
         
         if m == "2":
@@ -502,7 +511,11 @@ def main():
                 print("Select the database for this Blue/Green:")
                 identifier = choose_db(rds)["id"]
             
-            print("\n1) Switch\n2) Delete BG\n3) Status\n0) Back")
+            print("\n--- Resume Blue-Green Deployment ---")
+            print("1) Switch         - Execute switchover")
+            print("2) Delete         - Remove deployment")
+            print("3) View status    - Show deployment details")
+            print("0) Back")
             if (c := input("Action: ").strip()) == "1":
                 switch_over(rds, bg_id)
                 verify_endpoint(rds, identifier)
@@ -513,33 +526,49 @@ def main():
                 if s := bg_status(rds, bg_id): print(json.dumps(s, indent=2, default=str))
             continue
         
+        if m == "3":
+            print("\nSelect the database to rollback:")
+            identifier = choose_db(rds)["id"]
+            rollback(rds, cw, identifier)
+            continue
+        
+        if m == "4":
+            delete_old(rds)
+            continue
+        
         db = choose_db(rds)
         identifier = db["id"]
         
         while True:
-            print("\n1) Create BG\n2) Switch\n3) Rollback\n4) Cleanup\n5) Advanced\n0) Back")
+            print("\n" + "-"*60)
+            print(f"Database: {identifier}")
+            print("-"*60)
+            print("1) Create Blue-Green  - Start resize with pre-checks & snapshot")
+            print("2) Switch             - Execute switchover to new instance class")
+            print("3) Rollback           - Revert to previous instance class")
+            print("4) Cleanup            - Delete deployments or old resources")
+            print("5) Advanced           - Manual operations (checks, snapshots, status)")
+            print("0) Back")
+            print("-"*60)
             action = input("Action: ").strip()
             if action == "0": break
             
             if action == "1":
                 target = pick_target_class(rds, identifier)
-                is_clu, desc = is_cluster(rds, identifier)
-                current = None
-                if is_clu:
-                    writer = next((m for m in desc.get("DBClusterMembers", []) if m.get("IsClusterWriter")), None)
-                    if writer:
-                        try:
-                            current = rds.describe_db_instances(DBInstanceIdentifier=writer["DBInstanceIdentifier"])["DBInstances"][0].get("DBInstanceClass")
-                        except: pass
-                else:
-                    current = desc.get("DBInstanceClass")
+                _, desc = is_cluster(rds, identifier)
+                current = desc.get("DBInstanceClass")
                 
                 metrics = prechecks(rds, cw, identifier)
                 if not print_checks(metrics):
-                    if input("Continue anyway? (yes): ").strip().lower() != "yes": continue
+                    print("⚠️  Pre-checks show concerning values. Review before proceeding.")
+                    if input("Continue anyway? (yes): ").strip().lower() != "yes": 
+                        continue
                 
-                if current and not check_suitability(identifier, current, target, metrics):
-                    if input("Proceed? (yes): ").strip().lower() != "yes": continue
+                if current:
+                    if not check_suitability(identifier, current, target, metrics):
+                        print("\n🚫 Cannot proceed - target instance is insufficient for current workload.")
+                        input("Press Enter to choose a different instance class...")
+                        continue
                 
                 create_snapshot(rds, identifier)
                 bg_id = create_bg(rds, identifier, target)
@@ -571,7 +600,10 @@ def main():
                 input("\nPress Enter...")
             
             elif action == "4":
-                print("\n1) Delete BG\n2) Delete old resource")
+                print("\n--- Cleanup ---")
+                print("1) Delete Blue-Green deployment")
+                print("2) Delete old instance (with -old suffix)")
+                print("0) Cancel")
                 if (c := input("Action: ").strip()) == "1":
                     if bg_id := choose_bg(rds): delete_bg(rds, bg_id)
                 elif c == "2":
@@ -579,7 +611,11 @@ def main():
                 input("\nPress Enter...")
             
             elif action == "5":
-                print("\n1) Precheck\n2) Snapshot\n3) BG Status")
+                print("\n--- Advanced Operations ---")
+                print("1) Run pre-checks         - CloudWatch metrics analysis")
+                print("2) Create snapshot        - Manual backup")
+                print("3) View deployment status - Check Blue-Green details")
+                print("0) Cancel")
                 if (c := input("Action: ").strip()) == "1":
                     print_checks(prechecks(rds, cw, identifier))
                 elif c == "2":
