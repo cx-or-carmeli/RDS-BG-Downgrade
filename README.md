@@ -15,7 +15,8 @@ The script will automatically install `boto3` if needed.
 
 - **Minimal downtime** - Seconds during switchover (vs 5-15 min for direct modify)
 - **Both directions** - Upgrade or downgrade instance class
-- **Pre-flight checks** - CloudWatch metrics analysis
+- **Pre-flight checks** - CloudWatch metrics analysis (CPU, memory, IOPS, connections)
+- **AWS safety guardrails** - Blocks unsafe resizes that don't meet AWS recommendations
 - **Automatic snapshots** - Backup before changes
 - **Easy rollback** - Revert to previous instance class if needed
 
@@ -35,6 +36,20 @@ The script will automatically install `boto3` if needed.
 - **Safety**: Test green environment before switching
 - **Rollback**: Easy revert if issues occur
 - **Zero data loss**: Continuous replication until switch
+
+## Safety Thresholds (AWS Best Practices)
+
+The script enforces AWS recommended thresholds to prevent unsafe resizes:
+
+**Critical (blocks resize):**
+- CPU utilization would exceed **80%**
+- Free memory would drop below **1 GiB**
+
+**Warning (allows override):**
+- CPU utilization would exceed **60%**
+- Free memory would drop below **2 GiB**
+
+If a resize fails suitability checks, the script blocks proceeding and recommends choosing a larger instance class.
 
 ## Files
 
