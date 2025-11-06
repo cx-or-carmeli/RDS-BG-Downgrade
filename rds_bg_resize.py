@@ -2,7 +2,7 @@
 """RDS Blue/Green Instance Resize - Automates RDS instance class changes via Blue/Green deployments."""
 import os, pathlib, subprocess, sys, venv
 
-# Ensure boto3 is installed (auto-creates venv and installs if missing)
+# Auto-install boto3 if missing
 def _bootstrap_boto3():
     try:
         import boto3; return  # noqa
@@ -28,25 +28,30 @@ from config import (GIB, CPU_WARNING_THRESHOLD as CPU_WARN, CPU_CRITICAL_THRESHO
                     PREFERRED_INSTANCE_TYPES, MAX_INSTANCE_DISPLAY, DELETABLE_INSTANCE_STATES,
                     ETA_ESTIMATES, STORAGE_THRESHOLDS)
 
+# Get current time in UTC
 def now_utc():
     return dt.datetime.now(getattr(dt, "UTC", dt.timezone.utc))
 
+# Calculate time window for metrics
 def time_range(minutes=15):
     end = now_utc()
     return end - dt.timedelta(minutes=minutes), end
 
+# Setup AWS session from env vars
 def get_session():
     try:
         return boto3.Session()
     except (ProfileNotFound, NoRegionError) as e:
         print(f"Error: {e}"); sys.exit(2)
 
+# Print startup info with profile and region
 def print_banner(sess):
     print(f"=== RDS Blue/Green Resize ===\nProfile: {os.environ.get('AWS_PROFILE', 'default')}")
     if not sess.region_name:
         print("No region set. Export AWS_REGION=eu-west-1"); sys.exit(2)
     print(f"Region: {sess.region_name}\n")
 
+# Let user pick from a numbered list
 def select_from_list(items, prompt="Choose"):
     while True:
         choice = input(f"{prompt}: ").strip()
@@ -54,6 +59,7 @@ def select_from_list(items, prompt="Choose"):
             return items[int(choice) - 1]
         print("Invalid")
 
+# Get all RDS instances in the account
 def list_dbs(rds):
     items = []
     try:
@@ -65,6 +71,7 @@ def list_dbs(rds):
     except: pass
     return items
 
+# Show list and let user select a database
 def choose_db(rds):
     items = list_dbs(rds)
     if not items:
@@ -75,13 +82,14 @@ def choose_db(rds):
         print(f"  {i}) {item['id']} | {item.get('engine')} | {item.get('class')}{storage}")
     return select_from_list(items)
 
-# Get RDS instance description (returns False for legacy compatibility, description)
+# Fetch instance details from AWS
 def is_cluster(rds, identifier):
     try:
         return False, rds.describe_db_instances(DBInstanceIdentifier=identifier)["DBInstances"][0]
     except ClientError:
         print(f"Instance not found: {identifier}"); sys.exit(2)
 
+# Pull a single metric from CloudWatch
 def get_metric(cw, metric, inst_id, minutes=15):
     start, end = time_range(minutes)
     resp = cw.get_metric_statistics(Namespace="AWS/RDS", MetricName=metric,
@@ -90,7 +98,7 @@ def get_metric(cw, metric, inst_id, minutes=15):
     dps = sorted(resp.get("Datapoints", []), key=lambda x: x["Timestamp"])
     return float(dps[-1]["Average"]) if dps else None
 
-# Get CloudWatch metrics (CPU, memory, IOPS, connections) for pre/post validation
+# Grab recent metrics from CloudWatch
 def prechecks(rds, cw, identifier):
     _, desc = is_cluster(rds, identifier)
     inst_id = desc["DBInstanceIdentifier"]
@@ -102,7 +110,7 @@ def prechecks(rds, cw, identifier):
         "Connections": get_metric(cw, "DatabaseConnections", inst_id),
     }
 
-# Display metrics and check if they pass warning thresholds
+# Show metrics and check against thresholds
 def print_checks(metrics, title="Checks"):
     print(f"\n{title} (last 15 min):")
     for k, v in metrics.items():
@@ -115,7 +123,7 @@ def print_checks(metrics, title="Checks"):
     print(f"Status: {'OK' if ok else 'Warning'}")
     return ok
 
-# Poll snapshot status until it's ready (shows progress percentage)
+# Wait for snapshot to finish
 def wait_snapshot(rds, snap_id):
     print("Waiting for snapshot...")
     last_pct = -1
@@ -130,7 +138,7 @@ def wait_snapshot(rds, snap_id):
         except: pass
         time.sleep(POLL_INTERVAL)
 
-# Create a backup snapshot before making changes
+# Take a snapshot before making changes
 def create_snapshot(rds, identifier):
     snap_id = f"{identifier}-pre-resize-{now_utc().strftime('%Y%m%d-%H%M%S')}"
     print(f"\nCreating snapshot: {snap_id}")
@@ -139,7 +147,7 @@ def create_snapshot(rds, identifier):
     wait_snapshot(rds, snap_id)
     return snap_id
 
-# Analyze if target instance can handle current workload (CPU/memory projection)
+# Check if target instance will handle the workload
 def check_suitability(identifier, current_class, target_class, metrics):
     print(f"\n=== Suitability: {current_class} -> {target_class} ===")
     if current_class not in INSTANCE_SPECS or target_class not in INSTANCE_SPECS:
@@ -180,7 +188,7 @@ def check_suitability(identifier, current_class, target_class, metrics):
     
     return True
 
-# Get list of instance classes available for this engine/version
+# Get valid instance classes for this database
 def list_orderable(rds, engine, version, storage_type):
     classes = set()
     def call(**kw):
@@ -198,7 +206,7 @@ def list_orderable(rds, engine, version, storage_type):
         except: continue
     return sorted(classes)
 
-# Show available instance classes and let user choose target
+# Let user pick target instance class
 def pick_target_class(rds, identifier):
     _, desc = is_cluster(rds, identifier)
     allowed = list_orderable(rds, desc.get("Engine", "").lower(), desc.get("EngineVersion", ""),
@@ -221,7 +229,7 @@ def pick_target_class(rds, identifier):
             if 1 <= idx <= len(ordered[:MAX_INSTANCE_DISPLAY]):
                 return ordered[idx - 1]
 
-# Estimate how long Blue/Green provisioning will take (in minutes)
+# Rough estimate for how long BG will take
 def estimate_eta(engine, storage_gb):
     eng = (engine or "").lower()
     if "aurora" in eng: 
@@ -234,9 +242,8 @@ def estimate_eta(engine, storage_gb):
         return ETA_ESTIMATES["medium"]
     return ETA_ESTIMATES["large"]
 
-# Find existing Blue/Green deployment for a source database
+# Look for existing BG deployment for this database
 def find_existing_bg_for_source(rds, identifier):
-    """Find existing Blue/Green deployment for a source database."""
     _, desc = is_cluster(rds, identifier)
     source_arn = desc["DBInstanceArn"].lower()
     
@@ -248,7 +255,7 @@ def find_existing_bg_for_source(rds, identifier):
                     return d
     return None
 
-# Create Blue/Green deployment (handles existing deployment conflict gracefully)
+# Create new BG deployment or handle existing one
 def create_bg(rds, identifier, target_class):
     _, desc = is_cluster(rds, identifier)
     name = f"bg-{identifier}-{now_utc().strftime('%Y%m%d-%H%M%S')}"
@@ -310,14 +317,14 @@ def create_bg(rds, identifier, target_class):
                 return None
         raise
 
-# Get current status of a Blue/Green deployment
+# Check BG deployment status
 def bg_status(rds, bg_id):
     try:
         return rds.describe_blue_green_deployments(BlueGreenDeploymentIdentifier=bg_id)["BlueGreenDeployments"][0]
     except ClientError as e:
         return None if e.response.get("Error", {}).get("Code") == "BlueGreenDeploymentNotFoundFault" else (_ for _ in ()).throw(e)
 
-# Wait for Blue/Green deployment to reach SWITCH_READY status (polls every 30s)
+# Wait until BG is ready to switch
 def wait_ready(rds, bg_id, timeout_min=BG_TIMEOUT):
     print("\nWaiting for SWITCH_READY...")
     start, last = time.time(), ""
@@ -332,7 +339,7 @@ def wait_ready(rds, bg_id, timeout_min=BG_TIMEOUT):
         time.sleep(BG_POLL)
     print("Timeout"); return False
 
-# Perform the Blue/Green switchover (switches green to production)
+# Execute the BG switchover
 def switch_over(rds, bg_id):
     print(f"\nSwitching: {bg_id}")
     rds.switchover_blue_green_deployment(BlueGreenDeploymentIdentifier=bg_id)
@@ -347,13 +354,13 @@ def switch_over(rds, bg_id):
             raise RuntimeError(f"Failed: {st}")
         time.sleep(10)
 
-# Verify database endpoint after switchover (confirms endpoint unchanged)
+# Check endpoint after switch
 def verify_endpoint(rds, identifier):
     _, desc = is_cluster(rds, identifier)
     ep = desc.get("Endpoint") or {}
     print(f"\nVerified: {identifier} | {ep.get('Address')}:{ep.get('Port')}")
 
-# List all active Blue/Green deployments in the region
+# Get all BG deployments in the region
 def list_bgs(rds):
     items = []
     for page in rds.get_paginator("describe_blue_green_deployments").paginate():
@@ -363,7 +370,7 @@ def list_bgs(rds):
                             "created": d.get("CreateTime")})
     return items
 
-# Show list of Blue/Green deployments and let user choose one
+# Let user select a BG deployment
 def choose_bg(rds):
     items = list_bgs(rds)
     if not items:
@@ -374,7 +381,7 @@ def choose_bg(rds):
     choice = input("Pick (0=cancel): ").strip()
     return items[int(choice) - 1]["id"] if choice.isdigit() and 1 <= int(choice) <= len(items) else None
 
-# Delete a Blue/Green deployment record from AWS
+# Delete BG deployment from AWS
 def delete_bg(rds, bg_id):
     print(f"Deleting BG: {bg_id}")
     rds.delete_blue_green_deployment(BlueGreenDeploymentIdentifier=bg_id)
@@ -382,17 +389,15 @@ def delete_bg(rds, bg_id):
         time.sleep(5)
     print("Deleted")
 
-# Find old resource with -old suffix (used for rollback)
+# Find old instance for rollback
 def find_old_resource(rds, base_id):
-    """Find old resource with -old suffix."""
     for i in rds.describe_db_instances().get("DBInstances", []):
         if any(i["DBInstanceIdentifier"] == base_id + s for s in OLD_SUFFIXES):
             return {"id": i["DBInstanceIdentifier"], "class": i.get("DBInstanceClass")}
     return None
 
-# Rollback to previous instance class via reverse Blue/Green
+# Revert to previous instance class
 def rollback(rds, cw, identifier):
-    """Rollback to previous instance class via reverse Blue/Green."""
     print("\n=== Rollback ===")
     base_id = identifier
     for suffix in OLD_SUFFIXES:
@@ -433,7 +438,7 @@ def rollback(rds, cw, identifier):
     else:
         print("Not ready. Check AWS Console")
 
-# Clean up old resources (instances with -old suffix)
+# Delete old instances with -old suffix
 def delete_old(rds):
     items = []
     for i in rds.describe_db_instances().get("DBInstances", []):
@@ -482,7 +487,7 @@ def delete_old(rds):
             print(f"ERROR: {e}")
             raise
 
-# Main menu: create new resize, resume existing, or manage old resources
+# Main entry point
 def main():
     sess = get_session()
     print_banner(sess)
