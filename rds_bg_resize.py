@@ -37,18 +37,43 @@ def time_range(minutes=15):
     end = now_utc()
     return end - dt.timedelta(minutes=minutes), end
 
-# Setup AWS session from env vars
+# Let user pick AWS region
+def choose_region():
+    common_regions = [
+        "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+        "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1",
+        "ap-southeast-1", "ap-southeast-2", "ap-northeast-1"
+    ]
+    print("\n=== Select Region ===")
+    for i, region in enumerate(common_regions, 1):
+        print(f"  {i}) {region}")
+    print(f"  {len(common_regions) + 1}) Enter custom region")
+    
+    choice = input("Choose region: ").strip()
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(common_regions):
+            return common_regions[idx - 1]
+        elif idx == len(common_regions) + 1:
+            return input("Enter region (e.g., eu-west-2): ").strip()
+    return None
+
+# Setup AWS session from env vars or prompt for region
 def get_session():
     try:
-        return boto3.Session()
+        sess = boto3.Session()
+        if not sess.region_name:
+            region = choose_region()
+            if not region:
+                print("No region selected"); sys.exit(2)
+            sess = boto3.Session(region_name=region)
+        return sess
     except (ProfileNotFound, NoRegionError) as e:
         print(f"Error: {e}"); sys.exit(2)
 
 # Print startup info with profile and region
 def print_banner(sess):
-    print(f"=== RDS Blue/Green Resize ===\nProfile: {os.environ.get('AWS_PROFILE', 'default')}")
-    if not sess.region_name:
-        print("No region set. Export AWS_REGION=eu-west-1"); sys.exit(2)
+    print(f"\n=== RDS Blue/Green Resize ===\nProfile: {os.environ.get('AWS_PROFILE', 'default')}")
     print(f"Region: {sess.region_name}\n")
 
 # Let user pick from a numbered list
@@ -418,7 +443,10 @@ def rollback(rds, cw, identifier):
     
     print("Running pre-checks...")
     metrics = prechecks(rds, cw, base_id)
-    print_checks(metrics)
+    if not print_checks(metrics):
+        print("\nBLOCKED: Pre-checks failed. Cannot proceed with rollback.")
+        print("   Current metrics show concerning CPU or memory values.")
+        return
     
     print(f"Creating reverse Blue/Green to {target_class}...")
     bg_id = create_bg(rds, base_id, target_class)
@@ -528,9 +556,14 @@ def main():
             print("3) View status    - Show deployment details")
             print("0) Back")
             if (c := input("Action: ").strip()) == "1":
-                switch_over(rds, bg_id)
-                verify_endpoint(rds, identifier)
-                print_checks(prechecks(rds, cw, identifier), "Post-switch")
+                metrics = prechecks(rds, cw, identifier)
+                if not print_checks(metrics):
+                    print("\nBLOCKED: Pre-checks failed. Cannot proceed with switchover.")
+                    print("   Current metrics show concerning CPU or memory values.")
+                else:
+                    switch_over(rds, bg_id)
+                    verify_endpoint(rds, identifier)
+                    print_checks(prechecks(rds, cw, identifier), "Post-switch")
             elif c == "2":
                 delete_bg(rds, bg_id)
             elif c == "3":
@@ -571,9 +604,11 @@ def main():
                 
                 metrics = prechecks(rds, cw, identifier)
                 if not print_checks(metrics):
-                    print("WARNING: Pre-checks show concerning values. Review before proceeding.")
-                    if input("Continue anyway? (yes): ").strip().lower() != "yes": 
-                        continue
+                    print("\nBLOCKED: Pre-checks failed. Cannot proceed with Blue/Green deployment.")
+                    print("   Current metrics show concerning CPU or memory values.")
+                    print("   Wait for metrics to stabilize before attempting resize.")
+                    input("Press Enter to return...")
+                    continue
                 
                 if current:
                     if not check_suitability(identifier, current, target, metrics):
@@ -599,7 +634,11 @@ def main():
                 if not bg_status(rds, bg_id):
                     print("Not found"); continue
                 metrics = prechecks(rds, cw, identifier)
-                print_checks(metrics)
+                if not print_checks(metrics):
+                    print("\nBLOCKED: Pre-checks failed. Cannot proceed with switchover.")
+                    print("   Current metrics show concerning CPU or memory values.")
+                    input("\nPress Enter...")
+                    continue
                 if input("Switch? (yes): ").strip().lower() == "yes":
                     switch_over(rds, bg_id)
                     verify_endpoint(rds, identifier)
@@ -624,14 +663,49 @@ def main():
             elif action == "5":
                 print("\n--- Advanced Operations ---")
                 print("1) Run pre-checks         - CloudWatch metrics analysis")
-                print("2) Create snapshot        - Manual backup")
-                print("3) View deployment status - Check Blue-Green details")
+                print("2) Check feasibility      - Test if resize would be allowed (no deployment)")
+                print("3) Create snapshot        - Manual backup")
+                print("4) View deployment status - Check Blue-Green details")
                 print("0) Cancel")
                 if (c := input("Action: ").strip()) == "1":
                     print_checks(prechecks(rds, cw, identifier))
                 elif c == "2":
-                    create_snapshot(rds, identifier)
+                    # Feasibility check without creating deployment
+                    _, desc = is_cluster(rds, identifier)
+                    current = desc.get("DBInstanceClass")
+                    print(f"\nCurrent instance: {identifier} ({current})")
+                    
+                    target = pick_target_class(rds, identifier)
+                    if not target:
+                        continue
+                    
+                    print("\n" + "="*60)
+                    print(f"Feasibility Check: {current} -> {target}")
+                    print("="*60)
+                    
+                    metrics = prechecks(rds, cw, identifier)
+                    precheck_pass = print_checks(metrics)
+                    
+                    if not precheck_pass:
+                        print("\n❌ RESULT: Would be BLOCKED")
+                        print("   Reason: Current metrics show concerning CPU or memory values")
+                        print("   Action: Wait for metrics to stabilize before attempting resize")
+                    elif current:
+                        suitability_pass = check_suitability(identifier, current, target, metrics)
+                        if not suitability_pass:
+                            print("\n❌ RESULT: Would be BLOCKED")
+                            print("   Reason: Target instance insufficient for current workload")
+                            print("   Action: Choose a larger target instance class")
+                        else:
+                            print("\n✅ RESULT: Resize would be ALLOWED")
+                            print("   Both pre-checks and suitability analysis passed")
+                            print("   You can proceed with creating a Blue/Green deployment")
+                    else:
+                        print("\n✅ RESULT: Pre-checks passed")
+                        print("   Note: Could not verify suitability (instance class specs unknown)")
                 elif c == "3":
+                    create_snapshot(rds, identifier)
+                elif c == "4":
                     if bg_id := choose_bg(rds):
                         if s := bg_status(rds, bg_id): print(json.dumps(s, indent=2, default=str))
                 input("\nPress Enter...")
